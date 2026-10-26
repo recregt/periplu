@@ -345,13 +345,15 @@ def remove_snapshots() -> None:
             )
 
 
-def _cgroup_of(name: str) -> pathlib.Path:
+def _cgroup_of(name: str) -> pathlib.Path | None:
     path = subprocess.run(
         ["podman", "inspect", "-f", "{{.State.CgroupPath}}", name],
         capture_output=True,
         text=True,
         check=True,
     ).stdout.strip()
+    if not path.strip("/"):
+        return None
     return resources.CGROUP_ROOT / path.lstrip("/")
 
 
@@ -403,7 +405,8 @@ def admitted(
                     variant=variant,
                     inotify_instances=max(counts) if counts else None,
                 )
-                resources.record(test, cgroup, measured)
+                if cgroup is not None:
+                    resources.record(test, cgroup, measured)
     finally:
         resources.release(name)
 
