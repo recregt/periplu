@@ -79,6 +79,9 @@
             pkgs.addlicense
             pkgs.lefthook
           ];
+          PYTHONDONTWRITEBYTECODE = "1";
+          RUFF_NO_CACHE = "true";
+          PYTEST_ADDOPTS = "-p no:cacheprovider";
         };
       });
     };
