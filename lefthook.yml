@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 remotes:
   - git_url: https://github.com/recregt/commitlint
     ref: v2.0.0
@@ -9,6 +13,8 @@ pre-commit:
     ruff:
       glob: "*.py"
       run: nix build --no-link .#checks.$(nix eval --raw --impure --expr builtins.currentSystem).ruff
+    license:
+      run: nix build --no-link .#checks.$(nix eval --raw --impure --expr builtins.currentSystem).license
 
 pre-push:
   commands:
