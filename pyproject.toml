@@ -1,0 +1,19 @@
+[project]
+name = "periplu"
+version = "0.1.0"
+description = "A pytest plugin for deterministic container tests: waits end on events, never on clocks"
+readme = "README.md"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = [
+    "pytest>=8.4",
+    "pytest-xdist>=3.8",
+]
+
+[project.entry-points.pytest11]
+periplu = "periplu.plugin"
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"

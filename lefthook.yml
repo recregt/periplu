@@ -1,0 +1,16 @@
+remotes:
+  - git_url: https://github.com/recregt/commitlint
+    ref: v2.0.0
+    configs:
+      - lefthook-remote.yml
+
+pre-commit:
+  commands:
+    ruff:
+      glob: "*.py"
+      run: nix build --no-link .#checks.$(nix eval --raw --impure --expr builtins.currentSystem).ruff
+
+pre-push:
+  commands:
+    checks:
+      run: nix flake check
