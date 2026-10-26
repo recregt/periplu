@@ -4,7 +4,7 @@
 
 [project]
 name = "periplu"
-version = "0.1.0"
+version = "0.1.1"
 description = "A pytest plugin for deterministic container tests: waits end on events, never on clocks"
 readme = "README.md"
 license = "MPL-2.0"

@@ -22,10 +22,13 @@ A pytest plugin for end-to-end tests in Podman containers. Waits end on events, 
 
 ## Install
 
-```toml
-[project]
-dependencies = ["periplu @ git+https://github.com/recregt/periplu@v0.1.0"]
+```sh
+uv add periplu
+```
 
+Then configure it in `pyproject.toml`:
+
+```toml
 [tool.pytest.ini_options]
 periplu_project = "myproject"
 periplu_baseline = "resources.json"
@@ -42,10 +45,11 @@ Both paths are relative to the pytest rootdir.
 
 ## A first suite
 
-[`examples/systemd`](examples/systemd) is a complete suite. Run it with:
+[`examples/systemd`](https://github.com/recregt/periplu/tree/main/examples/systemd) is a complete suite. Run it from a clone:
 
 ```sh
-cd examples/systemd
+git clone https://github.com/recregt/periplu
+cd periplu/examples/systemd
 uv run pytest -n auto
 ```
 
@@ -116,4 +120,4 @@ When a test that uses a `Container` fails, periplu writes `run-N.txt` for every 
 
 ## License
 
-[Mozilla Public License 2.0](LICENSE)
+[Mozilla Public License 2.0](https://github.com/recregt/periplu/blob/main/LICENSE)
