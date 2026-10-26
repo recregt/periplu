@@ -22,6 +22,8 @@ from periplu import resources, settings
 
 SNAPSHOT_TEST = "snapshot::{key}"
 READY = b"READY=1"
+NOTIFY_DIRECTORY = "/run/periplu"
+NOTIFY_NAME = "notify"
 PROCESS_TREE = ("ps", "-eo", "pid,ppid,stat,wchan:24,etime,args", "--forest")
 
 
@@ -186,37 +188,74 @@ def _booted(name: str, notifications: socket.socket) -> None:
     try:
         while True:
             readable, _, _ = select.select([notifications, ended.stdout], [], [])
-            if notifications in readable and READY in notifications.recv(4096).split(b"\n"):
-                return
+            if notifications in readable:
+                message = notifications.recv(select.PIPE_BUF)
+                if READY in message.split(b"\n"):
+                    return
             if ended.stdout in readable:
                 break
     finally:
         ended.kill()
         ended.wait()
     logs = subprocess.run(["podman", "logs", name], capture_output=True, text=True, check=False)
-    subprocess.run(["podman", "rm", "-f", name], capture_output=True, check=False)
     raise RuntimeError(
         f"container {name} ended before systemd finished booting\n"
         f"logs: {logs.stdout.strip()}{logs.stderr.strip()}"
     )
 
 
-def start(image: str, name: str, run_args: list[str], systemd: bool) -> None:
+def _drain(notifications: socket.socket, stop: int) -> None:
+    while True:
+        readable, _, _ = select.select([notifications, stop], [], [])
+        if stop in readable:
+            return
+        notifications.recv(select.PIPE_BUF)
+
+
+@contextlib.contextmanager
+def _listened(notifications: socket.socket) -> Iterator[None]:
+    stop, stopping = os.pipe()
+    drain = threading.Thread(target=_drain, args=(notifications, stop), daemon=True)
+    drain.start()
+    try:
+        yield
+    finally:
+        os.write(stopping, b"\n")
+        drain.join()
+        os.close(stop)
+        os.close(stopping)
+
+
+@contextlib.contextmanager
+def running(image: str, name: str, run_args: list[str], systemd: bool) -> Iterator[None]:
     command = ["podman", "run", "-d", *run_args, "--name", name, image]
-    if not systemd:
-        subprocess.run(command, check=True, capture_output=True)
-        return
-    with tempfile.TemporaryDirectory(prefix="periplu-") as directory:
-        address = os.path.join(directory, "notify")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifications:
-            notifications.bind(address)
-            subprocess.run(
-                [*command[:3], "--systemd=always", "--sdnotify=container", *command[3:]],
-                check=True,
-                capture_output=True,
-                env={**os.environ, "NOTIFY_SOCKET": address},
-            )
+    try:
+        if not systemd:
+            subprocess.run(command, check=True, capture_output=True)
+            yield
+            return
+        with (
+            tempfile.TemporaryDirectory(prefix="periplu-") as directory,
+            socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifications,
+        ):
+            notifications.bind(os.path.join(directory, NOTIFY_NAME))
+            notify = [
+                "--systemd=always",
+                "--sdnotify=ignore",
+                "--volume",
+                f"{directory}:{NOTIFY_DIRECTORY}",
+                "--env",
+                f"NOTIFY_SOCKET={NOTIFY_DIRECTORY}/{NOTIFY_NAME}",
+            ]
+            subprocess.run([*command[:3], *notify, *command[3:]], check=True, capture_output=True)
             _booted(name, notifications)
+            with _listened(notifications):
+                try:
+                    yield
+                finally:
+                    subprocess.run(["podman", "rm", "-f", name], capture_output=True, check=False)
+    finally:
+        subprocess.run(["podman", "rm", "-f", name], capture_output=True, check=False)
 
 
 def image(containerfile: pathlib.Path) -> str:
@@ -330,15 +369,14 @@ def admitted(
     name = new_name()
     waited = resources.admit(name, test, resources.demand_for(test, _known()))
     started = time.monotonic()
-    cgroup = None
     try:
-        start(image, name, run_args, systemd)
-        cgroup = _cgroup_of(name)
-        yield name
+        with running(image, name, run_args, systemd):
+            cgroup = _cgroup_of(name)
+            try:
+                yield name
+            finally:
+                resources.record(test, cgroup, time.monotonic() - started, waited, variant)
     finally:
-        if cgroup is not None:
-            resources.record(test, cgroup, time.monotonic() - started, waited, variant)
-        subprocess.run(["podman", "rm", "-f", name], capture_output=True, check=False)
         resources.release(name)
 
 
