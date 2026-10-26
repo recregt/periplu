@@ -34,7 +34,7 @@ def _required(config, name: str) -> str:
     return value
 
 
-def pytest_configure(config):
+def _configure(config) -> None:
     root = config.rootpath
     settings.configure(
         settings.Settings(
@@ -44,6 +44,10 @@ def pytest_configure(config):
             failures=(root / _required(config, "periplu_failures")).resolve(),
         )
     )
+
+
+def pytest_configure(config):
+    _configure(config)
     if _is_controller(config):
         container.reap_orphans()
         os.environ.setdefault(settings.CONTROLLER_ENV, str(os.getpid()))
@@ -71,8 +75,9 @@ def pytest_runtest_makereport(item, call):
                 report.sections.append(("failure bundle", f"could not be gathered: {error!r}"))
 
 
-@pytest.hookimpl(optionalhook=True)
+@pytest.hookimpl(optionalhook=True, tryfirst=True)
 def pytest_xdist_auto_num_workers(config):
+    _configure(config)
     return resources.worker_cap()
 
 
@@ -114,10 +119,16 @@ def pytest_terminal_summary(terminalreporter, config):
         f"CPU per test up to {max(run['cpu_seconds'] / run['seconds'] for run in runs):.2f} cores; "
         f"admission waits {sum(run['waited_seconds'] for run in runs):.0f}s in total; "
         f"tasks per test up to {max(run.get('peak_tasks') or 0 for run in runs)}; "
-        f"forks refused by a task limit {sum(run.get('refused_forks') or 0 for run in runs)}"
+        f"forks refused by a task limit {sum(run.get('refused_forks') or 0 for run in runs)}; "
+        f"inotify instances per test up to "
+        f"{max(run.get('inotify_instances') or 0 for run in runs)}"
     )
     terminalreporter.write_line(
         f"capacity: {resources.cpu_capacity():g} cores, "
-        f"{resources.memory_available() / gib:.1f} GiB available now"
+        f"{resources.memory_available() / gib:.1f} GiB, "
+        f"{resources.inotify_in_use()} of {resources.inotify_limit()} inotify instances "
+        f"in use outside the suite (fs.inotify.max_user_instances)"
     )
+    allowed = ", ".join(f"{pool} {count}" for pool, count in resources.worker_caps().items())
+    terminalreporter.write_line(f"workers allowed by: {allowed}")
     terminalreporter.write_line(f"pressure stalls during the run: {stalls}")

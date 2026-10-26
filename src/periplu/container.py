@@ -24,6 +24,7 @@ SNAPSHOT_TEST = "snapshot::{key}"
 READY = b"READY=1"
 NOTIFY_DIRECTORY = "/run/periplu"
 NOTIFY_NAME = "notify"
+INOTIFY_COUNT = f"ls -l /proc/[0-9]*/fd 2>/dev/null | grep -c {resources.INOTIFY}"
 PROCESS_TREE = ("ps", "-eo", "pid,ppid,stat,wchan:24,etime,args", "--forest")
 
 
@@ -125,7 +126,7 @@ class Container:
     def probes(self) -> list[tuple[str, list[str]]]:
         return [("processes", list(PROCESS_TREE))]
 
-    def snapshot(self) -> str:
+    def describe(self) -> str:
         sections = []
         for title, probe in self.probes():
             result = self.exec(*probe)
@@ -144,7 +145,7 @@ class Container:
             )
             (folder / f"{name}.txt").write_text(contents)
             report.sections.append((name, contents))
-        (folder / "machine.txt").write_text(self.snapshot())
+        (folder / "machine.txt").write_text(self.describe())
         report.user_properties.append(("failure bundle", str(folder)))
 
     def exec(self, *args, env=None, check=False, user=None):
@@ -227,7 +228,7 @@ def _listened(notifications: socket.socket) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def running(image: str, name: str, run_args: list[str], systemd: bool) -> Iterator[None]:
+def running(image: str, name: str, *, run_args: list[str], systemd: bool) -> Iterator[None]:
     command = ["podman", "run", "-d", *run_args, "--name", name, image]
     try:
         if not systemd:
@@ -358,30 +359,62 @@ def new_name() -> str:
     return f"{settings.current().project}-test-{os.getpid()}-{time.time_ns()}"
 
 
+def _inotify_of(name: str) -> int | None:
+    identity = subprocess.run(
+        ["podman", "inspect", "-f", "{{.Id}} {{.NetworkSettings.SandboxKey}}", name],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.split()
+    if not identity:
+        return None
+    monitors = resources.inotify_of_processes_naming(identity)
+    inside = subprocess.run(
+        ["podman", "exec", name, "sh", "-c", INOTIFY_COUNT],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    return monitors + int(inside) if inside.isdigit() else None
+
+
 def _known() -> dict[str, resources.Demand]:
     return resources.snapshotted(settings.session())
 
 
 @contextlib.contextmanager
 def admitted(
-    test: str, image: str, run_args: list[str], systemd: bool, variant: str
+    test: str, image: str, *, run_args: list[str], systemd: bool, variant: str
 ) -> Iterator[str]:
     name = new_name()
     waited = resources.admit(name, test, resources.demand_for(test, _known()))
     started = time.monotonic()
     try:
-        with running(image, name, run_args, systemd):
+        with running(image, name, run_args=run_args, systemd=systemd):
             cgroup = _cgroup_of(name)
+            booted = _inotify_of(name)
             try:
                 yield name
             finally:
-                resources.record(test, cgroup, time.monotonic() - started, waited, variant)
+                counts = [count for count in (booted, _inotify_of(name)) if count is not None]
+                measured = resources.Measured(
+                    seconds=time.monotonic() - started,
+                    waited=waited,
+                    variant=variant,
+                    inotify_instances=max(counts) if counts else None,
+                )
+                resources.record(test, cgroup, measured)
     finally:
         resources.release(name)
 
 
 def snapshot(
-    key: str, image: str, run_args: list[str], systemd: bool, build: Callable[[str], None]
+    key: str,
+    image: str,
+    *,
+    run_args: list[str],
+    systemd: bool,
+    build: Callable[[str], None],
 ) -> str:
     tag = f"{_snapshot_repository()}:{_snapshot_prefix()}-{key}"
     cache = settings.current().cache
@@ -390,7 +423,13 @@ def snapshot(
         fcntl.flock(lock, fcntl.LOCK_EX)
         if subprocess.run(["podman", "image", "exists", tag], check=False).returncode == 0:
             return tag
-        with admitted(SNAPSHOT_TEST.format(key=key), image, run_args, systemd, "build") as name:
+        with admitted(
+            SNAPSHOT_TEST.format(key=key),
+            image,
+            run_args=run_args,
+            systemd=systemd,
+            variant="build",
+        ) as name:
             build(name)
             subprocess.run(["podman", "stop", name], check=True, capture_output=True)
             subprocess.run(

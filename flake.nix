@@ -26,6 +26,8 @@
                 root = ./.;
                 fileset = pkgs.lib.fileset.unions [
                   ./src
+                  ./tests
+                  ./examples
                   ./ruff.toml
                 ];
               };
@@ -38,11 +40,30 @@
               touch $out
             '';
 
+        tests =
+          pkgs.runCommand "periplu-tests"
+            {
+              nativeBuildInputs = [ (pkgs.python314.withPackages (ps: [ ps.pytest ])) ];
+              root = pkgs.lib.fileset.toSource {
+                root = ./.;
+                fileset = pkgs.lib.fileset.unions [
+                  ./src
+                  ./tests
+                  ./pyproject.toml
+                ];
+              };
+            }
+            ''
+              cd $root
+              PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 python -m pytest -q
+              touch $out
+            '';
+
         license = pkgs.runCommand "periplu-license" { nativeBuildInputs = [ pkgs.addlicense ]; } ''
           cd ${./.}
           addlicense -check \
-            -ignore 'LICENSE' -ignore 'uv.lock' -ignore 'flake.lock' -ignore '.python-version' \
-            -ignore '.venv/**' -ignore '.git/**' .
+            -ignore 'LICENSE' -ignore '**/uv.lock' -ignore 'flake.lock' -ignore '.python-version' \
+            -ignore '**/.venv/**' -ignore '.git/**' .
           touch $out
         '';
       });

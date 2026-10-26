@@ -1,0 +1,21 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[project]
+name = "periplu-example"
+version = "0.0.0"
+requires-python = ">=3.14"
+dependencies = ["periplu"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+periplu = { path = "../..", editable = true }
+
+[tool.pytest.ini_options]
+addopts = ["-p", "no:cacheprovider"]
+periplu_project = "periplu-example"
+periplu_baseline = "resources.json"
+periplu_failures = "failures"

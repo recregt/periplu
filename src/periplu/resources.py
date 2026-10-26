@@ -19,6 +19,9 @@ from periplu import settings
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 PRESSURE_ROOT = Path("/proc/pressure")
+PROC_ROOT = Path("/proc")
+INOTIFY_LIMIT = Path("/proc/sys/fs/inotify/max_user_instances")
+INOTIFY = "anon_inode:inotify"
 
 KEPT_RUNS = 8
 
@@ -44,6 +47,7 @@ class Demand:
     peak_bytes: int
     cpu_cores: float
     seconds: float
+    inotify_instances: int | None
 
 
 @functools.cache
@@ -80,14 +84,23 @@ def estimates() -> dict[str, Demand]:
     for test, entry in _baseline().items():
         if not _defined(test):
             continue
-        known[test] = Demand(entry["peak_bytes"], entry["cpu_cores"], entry["seconds"])
+        known[test] = Demand(
+            entry["peak_bytes"],
+            entry["cpu_cores"],
+            entry["seconds"],
+            entry.get("inotify_instances"),
+        )
     for test, history in measured.items():
         latest = history[-1].get("variant", "fresh")
         runs = [run for run in history if run.get("variant", "fresh") == latest]
+        instances = [
+            run["inotify_instances"] for run in runs if run.get("inotify_instances") is not None
+        ]
         known[test] = Demand(
             peak_bytes=max(run["peak_bytes"] for run in runs),
             cpu_cores=max(run["cpu_seconds"] / run["seconds"] for run in runs),
             seconds=statistics.median(run["seconds"] for run in runs),
+            inotify_instances=max(instances) if instances else None,
         )
     return known
 
@@ -117,14 +130,29 @@ def snapshotted(session: str) -> dict[str, Demand]:
 
 def demand_for(test: str, known: dict[str, Demand]) -> Demand | None:
     if test in known:
-        return known[test]
+        return _with_known_instances(known[test], known)
     if not known:
         return None
+    instances = _measured_instances(known.values())
     return Demand(
         peak_bytes=max(demand.peak_bytes for demand in known.values()),
         cpu_cores=max(demand.cpu_cores for demand in known.values()),
         seconds=max(demand.seconds for demand in known.values()),
+        inotify_instances=max(instances) if instances else None,
     )
+
+
+def _measured_instances(demands) -> list[int]:
+    return [demand.inotify_instances for demand in demands if demand.inotify_instances is not None]
+
+
+def _with_known_instances(demand: Demand, known: dict[str, Demand]) -> Demand:
+    if demand.inotify_instances is not None:
+        return demand
+    instances = _measured_instances(known.values())
+    if not instances:
+        return demand
+    return Demand(demand.peak_bytes, demand.cpu_cores, demand.seconds, max(instances))
 
 
 def _own_cgroup() -> Path:
@@ -169,30 +197,72 @@ def memory_available() -> int:
     return available
 
 
-def worker_cap() -> int:
+def _inotify_of_process(process: Path) -> int:
+    held = 0
+    with contextlib.suppress(OSError):
+        for descriptor in (process / "fd").iterdir():
+            with contextlib.suppress(OSError):
+                held += os.readlink(descriptor) == INOTIFY
+    return held
+
+
+def _processes():
+    return (process for process in PROC_ROOT.iterdir() if process.name.isdigit())
+
+
+def inotify_in_use() -> int:
+    return sum(_inotify_of_process(process) for process in _processes())
+
+
+def inotify_of_processes_naming(words: list[str]) -> int:
+    held = 0
+    for process in _processes():
+        with contextlib.suppress(OSError):
+            arguments = (process / "cmdline").read_bytes()
+            if any(word.encode() in arguments for word in words):
+                held += _inotify_of_process(process)
+    return held
+
+
+def inotify_available() -> int:
+    return inotify_limit() - inotify_in_use()
+
+
+def worker_caps() -> dict[str, int]:
     known = estimates()
     if not known:
-        return 1
+        return {}
     demands = known.values()
     seconds = sum(demand.seconds for demand in demands)
     longest = max(demand.seconds for demand in demands)
     cores = sum(demand.cpu_cores * demand.seconds for demand in demands) / seconds
     memory = sum(demand.peak_bytes * demand.seconds for demand in demands) / seconds
-    return max(
-        1,
-        min(
-            len(known),
-            math.ceil(seconds / longest),
-            math.floor(cpu_capacity() / cores),
-            math.floor(memory_available() / memory),
-        ),
-    )
+    caps = {"tests": len(known), "longest test": math.ceil(seconds / longest)}
+    if cores:
+        caps["cpu"] = math.floor(cpu_capacity() / cores)
+    if memory:
+        caps["memory"] = math.floor(memory_available() / memory)
+    counted = [demand for demand in demands if demand.inotify_instances]
+    if counted:
+        weight = sum(demand.seconds for demand in counted)
+        instances = sum(demand.inotify_instances * demand.seconds for demand in counted) / weight
+        caps["inotify"] = math.floor(inotify_available() / instances)
+    return caps
+
+
+def worker_cap() -> int:
+    caps = worker_caps()
+    return max(1, min(caps.values(), default=1))
+
+
+def inotify_limit() -> int:
+    return int(INOTIFY_LIMIT.read_text())
 
 
 def _load_ledger() -> dict:
     with contextlib.suppress(FileNotFoundError, ValueError):
         return json.loads(_ledger().read_text())
-    return {"running": {}, "waiting": [], "memory": 0}
+    return {"running": {}, "waiting": [], "memory": 0, "inotify": 0}
 
 
 @contextlib.contextmanager
@@ -202,6 +272,7 @@ def _locked():
         fcntl.flock(lock, fcntl.LOCK_EX)
         ledger = _load_ledger()
         ledger.setdefault("memory", 0)
+        ledger.setdefault("inotify", 0)
         ledger["running"] = {
             name: entry for name, entry in ledger["running"].items() if alive(entry["pid"])
         }
@@ -226,11 +297,15 @@ def _fits(ledger: dict, demand: Demand | None) -> bool:
         return True
     if demand is None:
         return settings.calibrating()
+    if demand.inotify_instances is None and not settings.calibrating():
+        return False
     reserved = sum(entry["peak_bytes"] for entry in running)
     cores = sum(entry["cpu_cores"] for entry in running)
+    instances = sum(entry.get("inotify_instances", 0) for entry in running)
     return (
         reserved + demand.peak_bytes <= ledger["memory"]
         and cores + demand.cpu_cores <= cpu_capacity()
+        and instances + (demand.inotify_instances or 0) <= ledger["inotify"]
     )
 
 
@@ -261,7 +336,8 @@ def admit(ticket: str, test: str, demand: Demand | None) -> float:
     """Returns once `test` may start, in arrival order, with the seconds it waited.
 
     A test is admitted when the peaks of everything running plus its own fit the memory that was
-    available when nothing of ours ran, and their cores fit the CPUs. Whether it fits changes
+    available when nothing of ours ran, their cores fit the CPUs, and their inotify instances fit
+    what the kernel allowed this user when nothing of ours ran. Whether it fits changes
     only when a test starts, ends or dies, so a waiter sleeps until one of those happens: a
     release writes to every waiter's FIFO, and a death closes the pidfd it holds.
     """
@@ -277,6 +353,7 @@ def admit(ticket: str, test: str, demand: Demand | None) -> float:
             with _locked() as ledger:
                 if not ledger["running"]:
                     ledger["memory"] = memory_available()
+                    ledger["inotify"] = inotify_available()
                 first = ledger["waiting"][0]["ticket"] == ticket
                 if first and _fits(ledger, demand):
                     ledger["waiting"].pop(0)
@@ -285,6 +362,7 @@ def admit(ticket: str, test: str, demand: Demand | None) -> float:
                         "pid": os.getpid(),
                         "peak_bytes": demand.peak_bytes if demand else 0,
                         "cpu_cores": demand.cpu_cores if demand else 0.0,
+                        "inotify_instances": (demand.inotify_instances or 0) if demand else 0,
                     }
                     _wake_waiters(ledger)
                     return time.monotonic() - started
@@ -292,7 +370,7 @@ def admit(ticket: str, test: str, demand: Demand | None) -> float:
             try:
                 select.select([wakes, *watched], [], [])
                 with contextlib.suppress(BlockingIOError):
-                    os.read(wakes, 4096)
+                    os.read(wakes, select.PIPE_BUF)
             finally:
                 for pidfd in watched:
                     os.close(pidfd)
@@ -321,7 +399,15 @@ def _refused_forks(cgroup: Path) -> int:
     return refused
 
 
-def record(test: str, cgroup: Path, seconds: float, waited: float, variant: str) -> None:
+@dataclass(frozen=True)
+class Measured:
+    seconds: float
+    waited: float
+    variant: str
+    inotify_instances: int | None
+
+
+def record(test: str, cgroup: Path, measured: Measured) -> None:
     peak = _read(cgroup / "memory.peak")
     tasks = _read(cgroup / "pids.peak")
     refused = _refused_forks(cgroup)
@@ -330,7 +416,7 @@ def record(test: str, cgroup: Path, seconds: float, waited: float, variant: str)
         (int(line.split()[1]) for line in stat.splitlines() if line.startswith("usage_usec")),
         None,
     )
-    if peak is None or usage is None or seconds <= 0:
+    if peak is None or usage is None or measured.seconds <= 0:
         return
     run = {
         "test": test,
@@ -339,9 +425,10 @@ def record(test: str, cgroup: Path, seconds: float, waited: float, variant: str)
         "peak_tasks": int(tasks) if tasks else None,
         "refused_forks": refused,
         "cpu_seconds": usage / 1_000_000,
-        "seconds": seconds,
-        "waited_seconds": waited,
-        "variant": variant,
+        "seconds": measured.seconds,
+        "waited_seconds": measured.waited,
+        "variant": measured.variant,
+        "inotify_instances": measured.inotify_instances,
     }
     settings.current().cache.mkdir(parents=True, exist_ok=True)
     with open(_history(), "a") as history:
@@ -387,6 +474,7 @@ def write_baseline() -> None:
                     "peak_bytes": demand.peak_bytes,
                     "cpu_cores": round(demand.cpu_cores, 3),
                     "seconds": round(demand.seconds, 1),
+                    "inotify_instances": demand.inotify_instances,
                 }
                 for test, demand in sorted(known.items())
             },

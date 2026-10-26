@@ -10,13 +10,25 @@ readme = "README.md"
 license = "MPL-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
+classifiers = [
+    "Framework :: Pytest",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Software Development :: Testing",
+]
 dependencies = [
     "pytest>=8.4",
     "pytest-xdist>=3.8",
 ]
 
+[project.urls]
+Repository = "https://github.com/recregt/periplu"
+
 [project.entry-points.pytest11]
 periplu = "periplu.plugin"
+
+[tool.pytest.ini_options]
+addopts = ["-p", "no:periplu", "-p", "no:cacheprovider"]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["uv_build>=0.13,<0.14"]
